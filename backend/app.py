@@ -1,12 +1,14 @@
 import os
 import pandas as pd
 from flask import Flask
+from flask import jsonify, request, abort
 from flask_cors import CORS 
 import yfinance as yf
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from scipy.optimize import minimize
 import numpy as np
+#from json import jsonify
 
 
 app = Flask(__name__)
@@ -120,9 +122,9 @@ class StockAdvisor:
         else:
             return 'High'
     
-    def optimize_portfolio(self, selected_stocks, risk_tolerance='balanced'):
-        """Optimize portfolio using Modern Portfolio Theory"""
-        """returns optimal weights, expected, return, optimal sharpe ratio etc"""
+    def optimize_portfolio(self, selected_stocks, risk_tolerance='balanced', investment_amount=10000):
+        """Optimize portfolio using Modern Portfolio Theory with capital-aware constraints"""
+        """returns optimal weights, expected return, optimal sharpe ratio etc"""
         if not selected_stocks or len(selected_stocks) < 2:
             return None
             
@@ -137,15 +139,34 @@ class StockAdvisor:
         risk_multiplier = {'conservative': 0.5, 'balanced': 1.0, 'aggressive': 1.5}
         risk_factor = risk_multiplier.get(risk_tolerance, 1.0)
         
+        # Calculate transaction costs based on investment 
+        # This allows for more realistic portfolio optimization by considering the cost of trading
+        transaction_costs = self.calculate_transaction_costs(selected_stocks, investment_amount)
+        
+        # Calculate minimum viable weights based on investment amount
+        min_weights = self.calculate_minimum_weights(selected_stocks, investment_amount)
+        
         def objective(weights): # error function of sharpe ratio given model weights
             portfolio_return = np.sum(weights * expected_returns)
             portfolio_variance = np.dot(weights.T, np.dot(cov_matrix, weights))
             sharpe_ratio = portfolio_return / np.sqrt(portfolio_variance)
-            return -sharpe_ratio * risk_factor
+            
+            # Adjust for transaction costs (net return consideration)
+            # This allows for minimization of sharpe ration in more realistic sense
+            net_return = portfolio_return - np.sum(weights * transaction_costs)
+            
+            # Penalize portfolios with too many small positions (diversification cost)
+            diversification_penalty = self.calculate_diversification_penalty(weights, investment_amount)
+            
+            # Final objective: maximize risk-adjusted net return
+            adjusted_sharpe = net_return / np.sqrt(portfolio_variance) - diversification_penalty
+            return -adjusted_sharpe * risk_factor
+        
+        # Dynamic bounds based on investment amount
+        bounds = self._calculate_dynamic_bounds(selected_stocks, investment_amount, min_weights)
         
         # constraint function (tuple because that's what minimize function takes)
         constraints = {'type': 'eq', 'func': lambda x: np.sum(x) - 1}
-        bounds = tuple((0, 0.4) for _ in range(len(selected_stocks)))  # Max 40% weights in any stock
         
         initial_guess = np.array([1/len(selected_stocks)] * len(selected_stocks))
         
@@ -154,8 +175,8 @@ class StockAdvisor:
             result = minimize(objective, initial_guess, method='SLSQP',
                             bounds=bounds, constraints=constraints)
             #minimize function using sequential least squares programming
-            # result after optimization would contain the ideal weights in the shape of inital guess
-            # I used similart metholodogy for rutgers research
+            # result after optimization would contain the ideal weights in the shape of initial guess
+            # Enhanced with capital-aware optimization
             
             if result.success:
                 optimal_weights = result.x
@@ -166,16 +187,92 @@ class StockAdvisor:
                 portfolio_volatility = np.sqrt(portfolio_variance)
                 sharpe_ratio = portfolio_return / portfolio_volatility
                 
+                # Calculate net return after transaction costs
+                net_return = portfolio_return - np.sum(optimal_weights * transaction_costs)
+                net_sharpe = net_return / portfolio_volatility if portfolio_volatility > 0 else 0
+                
                 return {
                     'weights': dict(zip(selected_stocks, optimal_weights)),
                     'expected_return': portfolio_return,
+                    'net_return': net_return,
                     'volatility': portfolio_volatility,
-                    'sharpe_ratio': sharpe_ratio
+                    'sharpe_ratio': sharpe_ratio,
+                    'net_sharpe_ratio': net_sharpe,
+                    'transaction_costs': transaction_costs,
+                    'investment_amount': investment_amount
                 }
         except Exception as e:
             print(f"Optimization error: {e}")
         
         return None
+    
+    def calculate_transaction_costs(self, selected_stocks, investment_amount):
+        """Calculate transaction costs for each stock based on investment amount"""
+      
+        base_commission = 1.0 if investment_amount < 5000 else 0.0
+        
+    
+        market_impact = 0.0001  # 0.01% for large cap S&P 500 stocks
+        
+        # Bid-ask spread (average 0.05% for large caps)
+        bid_ask_spread = 0.0005
+        
+        # Total cost per dollar invested
+        total_cost_rate = base_commission / (investment_amount / len(selected_stocks)) + market_impact + bid_ask_spread
+        
+        # Return array of costs for each stock
+        return np.full(len(selected_stocks), total_cost_rate)
+    
+    def calculate_minimum_weights(self, selected_stocks, investment_amount):
+        """Calculate minimum viable weights based on investment amount and stock prices for the lower_bounds"""
+        min_weights = []
+        
+        for stock in selected_stocks:
+            current_price = self.data[stock].iloc[-1]
+            # Minimum investment per stock: enough to buy at least 1 share + transaction costs
+            min_investment = current_price + 10  # $10 buffer for transaction costs
+            min_weight = min_investment / investment_amount
+            min_weights.append(min_weight)
+        
+        return np.array(min_weights)
+    
+    def calculate_diversification_penalty(self, weights, investment_amount):
+        """Penalize portfolios with too many small positions for smaller investments"""
+        # For smaller investments, prefer fewer, larger positions to reduce transaction costs
+        num_positions = np.sum(weights > 0.01)  
+        
+        if investment_amount < 5000:
+            # For small investments, penalize having more than 5-7 positions
+            if num_positions > 7:
+                return 0.01 * (num_positions - 7)
+        elif investment_amount < 25000:
+            # For medium investments, penalize having more than 10-12 positions
+            if num_positions > 12:
+                return 0.005 * (num_positions - 12)
+        
+        return 0.0
+    
+    def calculate_dynamic_bounds(self, selected_stocks, investment_amount, min_weights):
+        """Calculate dynamic bounds based on investment amount"""
+        bounds = []
+        
+        for i, stock in enumerate(selected_stocks):
+            min_weight = min_weights[i]
+            
+            # For smaller investments, allow higher concentration
+            if investment_amount < 10000:
+                max_weight = 0.5  # Allow up to 50% in one stock for small investments
+            elif investment_amount < 50000:
+                max_weight = 0.4  # Allow up to 40% for medium investments
+            else:
+                max_weight = 0.25  # Cap at 25% for large investments
+            
+            # Ensure max_weight is at least min_weight
+            max_weight = max(max_weight, min_weight)
+            
+            bounds.append((min_weight, max_weight))
+        
+        return tuple(bounds)
     
     def backtest_portfolio(self, weights, start_date=None, end_date=None):
         """Backtest the portfolio performance"""
@@ -227,6 +324,117 @@ class StockAdvisor:
     
 advisor=StockAdvisor()
 
+@app.route("/health")
+def health_check():
+    return {"status": "ok"}
+@app.route("/api/init", methods=["POST"])
+def init_process():
+
+    """Initialize the  advisor with market data"""
+    try:
+        success = advisor.fetch_market_data(period="2y")
+        if success:
+            cluster_analysis = advisor.perform_clustering()
+            return jsonify({
+                'success': True,
+                'message': 'Data initialized successfully',
+                'clusters': cluster_analysis,
+                'total_stocks': len(advisor.data.columns) if advisor.data is not None else 0
+            })
+        else:
+            return jsonify({'success': False, 'message': 'Failed to fetch market data'}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+    
+@app.route("/api/clusters", methods=["GET"])
+def get_clusters():
+    """Get the latest cluster analysis"""
+    if advisor.clusters is None:
+        return jsonify({'success': False, 'message': 'Data not initialized'}), 400
+    
+    cluster_analysis = advisor.perform_clustering()
+    return jsonify({'success': True, 'clusters': cluster_analysis})
+
+@app.route("/api/recommend", methods=["POST"])
+def recommend_stock():
+    """ Generate Stock recommendations based on user risk level. Based on risk level choose cluster and optimize portfolio
+    to get the best stock. Return list of stocks and their weights.
 
 
+    Returns: JSON 
+    -Success: True or False
+    -Message: Error message if any
+    -Portfolio:
+        -Allocations: Dictionary of stocks and their weights
+        -Expected Return: Expected return of the portfolio
+        -Volatility: Volatility of the portfolio
+        -Sharpe Ratio: Sharpe ratio of the portfolio
+        -Total Investment: Total investment amount
+    """
+    try:
+        data = request.json
+        risk_tolerance = data.get('risk_tolerance', 'balanced')
+        investment_amount = data.get('investment_amount', 10000)
+        selected_clusters = data.get('selected_clusters', [])
+
+        if advisor.clusters is None:
+            return jsonify({'success': False, 'message': 'Data not initialized'}), 400
+        if risk_tolerance == 'conservative':
+            # Select from low volatility clusters
+            target_volatility = advisor.clusters['volatility'].quantile(0.33)
+            selected_stocks = advisor.clusters[advisor.clusters['volatility'] <= target_volatility].index.tolist()[:15]
+        elif risk_tolerance == 'aggressive':
+            # Select from high return, high volatility clusters
+            target_return = advisor.clusters['annual_return'].quantile(0.67)
+            selected_stocks = advisor.clusters[advisor.clusters['annual_return'] >= target_return].index.tolist()[:15]
+        else:  # balanced
+            # Select from middle range
+            selected_stocks = advisor.clusters[
+                (advisor.clusters['sharpe_ratio'] > advisor.clusters['sharpe_ratio'].median()) &
+                (advisor.clusters['volatility'] < advisor.clusters['volatility'].quantile(0.75))
+            ].index.tolist()[:15]
         
+        if len(selected_stocks) < 5:
+            selected_stocks = advisor.clusters.nlargest(10, 'sharpe_ratio').index.tolist()
+        
+        # Use sharpe ratio minimization to optimize portfolio weights with capital consideration
+        optimized_portfolio = advisor.optimize_portfolio(selected_stocks, risk_tolerance, investment_amount)
+        
+        if optimized_portfolio is None:
+            return jsonify({'success': False, 'message': 'Portfolio optimization failed'}), 500
+        
+        # Calculate dollar allocations
+        dollar_weights = {}
+        for stock, weight in optimized_portfolio['weights'].items():
+            if weight > 0.01:  # Only include weights > 1%
+                dollar_weights[stock] = {
+                    'weight': weight,
+                    'dollar_amount': weight * investment_amount,
+                    'shares': int((weight * investment_amount) / advisor.data[stock].iloc[-1])
+                }
+        
+        # Backtest the portfolio
+        backtest_results = advisor.backtest_portfolio(optimized_portfolio['weights'])
+        
+        return jsonify({
+            'success': True,
+            'portfolio': {
+                'allocations': dollar_weights,
+                'expected_return': optimized_portfolio['expected_return'],
+                'net_return': optimized_portfolio.get('net_return', optimized_portfolio['expected_return']),
+                'volatility': optimized_portfolio['volatility'],
+                'sharpe_ratio': optimized_portfolio['sharpe_ratio'],
+                'net_sharpe_ratio': optimized_portfolio.get('net_sharpe_ratio', optimized_portfolio['sharpe_ratio']),
+                'total_investment': investment_amount,
+                'transaction_costs': optimized_portfolio.get('transaction_costs', [0] * len(selected_stocks))
+            },
+            'backtest': backtest_results,
+            'selected_stocks': selected_stocks
+        })
+
+    except Exception as e:
+        return jsonify({'success': False, 'message': 'Invalid input data'}), 400
+
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
