@@ -15,6 +15,8 @@ app = Flask(__name__)
 CORS(app)
 
 class StockAdvisor:
+    #Stock ADvisor class with functionality to fetch historical, data, cluster stocks based on metrics, optimize portfolio and backtest
+
     def __init__(self):
         self.sp500_symbols = [
             'AAPL', 'MSFT', 'AMZN', 'GOOGL', 'TSLA', 'META', 'BRK-B', 'UNH', 'JNJ', 'V',
@@ -23,6 +25,7 @@ class StockAdvisor:
             'NFLX', 'VZ', 'ADBE', 'WFC', 'T', 'NKE', 'AMD', 'CMCSA', 'BMY', 'TXN',
             'QCOM', 'DHR', 'UPS', 'PM', 'MS', 'HON', 'NEE', 'LOW', 'COP', 'AMGN'
         ]
+        self.custom_symbols = []  # User-added custom stocks
         self.data = None
         self.returns = None
         self.clusters = None
@@ -30,9 +33,11 @@ class StockAdvisor:
     def fetch_market_data(self,period):
         ''' fetch historical market data for given stocks, and set self.data'''
         try:
-            # Placeholder for actual market data fetching logic
+            
             data = {}
-            for symbol in self.sp500_symbols:
+            # Fetch data for both S&P 500 and custom stocks
+            all_symbols = self.get_all_symbols()
+            for symbol in all_symbols:
                 try:
                     ticker = yf.Ticker(symbol)
                     hist = ticker.history(period=period)
@@ -72,9 +77,10 @@ class StockAdvisor:
         return pd.DataFrame(metrics).T
     
     def calculate_max_drawdown(self, symbol):
+        #calculate drawdown for a given stock using drawdown formula
         prices = self.data[symbol]
-        cumulative = (1 + self.returns[symbol]).cumprod()
-        running_max = cumulative.expanding().max()
+        cumulative = (1 + self.returns[symbol]).cumprod() #cumulative product dataset
+        running_max = cumulative.expanding().max() 
         drawdown = (cumulative - running_max) / running_max
         return drawdown.min()
     
@@ -139,7 +145,7 @@ class StockAdvisor:
         risk_multiplier = {'conservative': 0.5, 'balanced': 1.0, 'aggressive': 1.5}
         risk_factor = risk_multiplier.get(risk_tolerance, 1.0)
         
-        # Calculate transaction costs based on investment 
+        # Calculate transaction costs based on  price put in originally  
         # This allows for more realistic portfolio optimization by considering the cost of trading
         transaction_costs = self.calculate_transaction_costs(selected_stocks, investment_amount)
         
@@ -274,6 +280,74 @@ class StockAdvisor:
         
         return tuple(bounds)
     
+    def add_custom_stocks(self, stock_symbols):
+        """Add custom stocks to the portfolio for analysis"""
+        if not isinstance(stock_symbols, list):
+            stock_symbols = [stock_symbols]
+        
+        added_stocks = []
+        failed_stocks = []
+        
+        for symbol in stock_symbols:
+            symbol = symbol.upper().strip()
+            if symbol not in self.sp500_symbols and symbol not in self.custom_symbols:
+                # Test if the stock symbol is valid by trying to fetch a small amount of data
+                try:
+                    ticker = yf.Ticker(symbol)
+                    # Try to get just 5 days of data to validate the symbol
+                    test_data = ticker.history(period="5d")
+                    if len(test_data) > 0:
+                        self.custom_symbols.append(symbol)
+                        added_stocks.append(symbol)
+                    else:
+                        failed_stocks.append(f"{symbol} (no data available)")
+                except Exception as e:
+                    failed_stocks.append(f"{symbol} (invalid symbol)")
+            else:
+                failed_stocks.append(f"{symbol} (already exists)")
+        
+        return {
+            'added': added_stocks,
+            'failed': failed_stocks,
+            'total_custom_stocks': len(self.custom_symbols)
+        }
+    
+    def remove_custom_stocks(self, stock_symbols):
+        """Remove custom stocks from the portfolio"""
+        if not isinstance(stock_symbols, list):
+            stock_symbols = [stock_symbols]
+        
+        removed_stocks = []
+        not_found_stocks = []
+        
+        for symbol in stock_symbols:
+            symbol = symbol.upper().strip()
+            if symbol in self.custom_symbols:
+                self.custom_symbols.remove(symbol)
+                removed_stocks.append(symbol)
+            else:
+                not_found_stocks.append(symbol)
+        
+        return {
+            'removed': removed_stocks,
+            'not_found': not_found_stocks,
+            'total_custom_stocks': len(self.custom_symbols)
+        }
+    
+    def get_all_symbols(self):
+        """Get all available stock symbols (S&P 500 + custom)"""
+        return self.sp500_symbols + self.custom_symbols
+    
+    def get_custom_symbols(self):
+        """Get list of custom stock symbols"""
+        return self.custom_symbols.copy()
+    
+    def clear_custom_stocks(self):
+        """Clear all custom stocks"""
+        removed_count = len(self.custom_symbols)
+        self.custom_symbols = []
+        return removed_count
+    
     def backtest_portfolio(self, weights, start_date=None, end_date=None):
         """Backtest the portfolio performance"""
         if weights is None:
@@ -355,6 +429,97 @@ def get_clusters():
     cluster_analysis = advisor.perform_clustering()
     return jsonify({'success': True, 'clusters': cluster_analysis})
 
+@app.route("/api/stocks/add", methods=["POST"])
+def add_custom_stocks():
+    """Add custom stocks to the portfolio for analysis"""
+    try:
+        data = request.json
+        stock_symbols = data.get('stocks', [])
+        
+        if not stock_symbols:
+            return jsonify({'success': False, 'message': 'No stocks provided'}), 400
+        
+        result = advisor.add_custom_stocks(stock_symbols)
+        
+        response_message = ""
+        if result['added']:
+            response_message += f"Successfully added: {', '.join(result['added'])}. "
+        if result['failed']:
+            response_message += f"Failed to add: {', '.join(result['failed'])}."
+        
+        return jsonify({
+            'success': True,
+            'message': response_message,
+            'added': result['added'],
+            'failed': result['failed'],
+            'total_custom_stocks': result['total_custom_stocks']
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route("/api/stocks/remove", methods=["POST"])
+def remove_custom_stocks():
+    """Remove custom stocks from the portfolio"""
+    try:
+        data = request.json
+        stock_symbols = data.get('stocks', [])
+        
+        if not stock_symbols:
+            return jsonify({'success': False, 'message': 'No stocks provided'}), 400
+        
+        result = advisor.remove_custom_stocks(stock_symbols)
+        
+        response_message = ""
+        if result['removed']:
+            response_message += f"Successfully removed: {', '.join(result['removed'])}. "
+        if result['not_found']:
+            response_message += f"Not found: {', '.join(result['not_found'])}."
+        
+        return jsonify({
+            'success': True,
+            'message': response_message,
+            'removed': result['removed'],
+            'not_found': result['not_found'],
+            'total_custom_stocks': result['total_custom_stocks']
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route("/api/stocks/list", methods=["GET"])
+def list_custom_stocks():
+    """Get list of custom stocks"""
+    try:
+        custom_stocks = advisor.get_custom_symbols()
+        all_stocks = advisor.get_all_symbols()
+        
+        return jsonify({
+            'success': True,
+            'custom_stocks': custom_stocks,
+            'total_custom_stocks': len(custom_stocks),
+            'total_available_stocks': len(all_stocks),
+            'sp500_stocks_count': len(advisor.sp500_symbols)
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route("/api/stocks/clear", methods=["POST"])
+def clear_custom_stocks():
+    """Clear all custom stocks"""
+    try:
+        removed_count = advisor.clear_custom_stocks()
+        
+        return jsonify({
+            'success': True,
+            'message': f'Cleared {removed_count} custom stocks',
+            'removed_count': removed_count
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
 @app.route("/api/recommend", methods=["POST"])
 def recommend_stock():
     """ Generate Stock recommendations based on user risk level. Based on risk level choose cluster and optimize portfolio
@@ -391,7 +556,7 @@ def recommend_stock():
             # Select from middle range
             selected_stocks = advisor.clusters[
                 (advisor.clusters['sharpe_ratio'] > advisor.clusters['sharpe_ratio'].median()) &
-                (advisor.clusters['volatility'] < advisor.clusters['volatility'].quantile(0.75))
+                (advisor.clusters['volatility'] < advisor.clusters['volatility'].quantile(0.75))  # boolean dataframe filtering
             ].index.tolist()[:15]
         
         if len(selected_stocks) < 5:

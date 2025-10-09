@@ -5,16 +5,22 @@ This agent interacts with the stock advisory API to provide personalized recomme
 
 import asyncio
 import json
+from huggingface_hub import InferenceClient
 import requests
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
-from smolagents import Agent, Tool, LLM
+from smolagents import InferenceClientModel, ToolCallingAgent, Tool, LLM
 from smolagents.tools import HttpTool
+from smolagents import FinalAnswerTool
+from smolagents import LiteLLMModel, CodeAgent
+from dotenv import load_dotenv
+
+
 
 
 @dataclass
 class UserProfile:
-    """User profile for stock recommendations"""
+    """User profile for stock recommendations, including the main parameters to be passed into the prediction agent"""
     risk_tolerance: str  # 'conservative', 'balanced', 'aggressive'
     investment_amount: float
     investment_goals: str
@@ -22,37 +28,39 @@ class UserProfile:
 
 
 class StockAdvisorAgent:
-    """AI Agent that provides stock recommendations using the stock advisory API"""
+    """Class built on top of smolagents api"""
     
-    def __init__(self, api_base_url: str = "http://localhost:5000", openai_api_key: str = "dummy-api-key"):
+    def __init__(self, api_base_url: str = "http://localhost:5000"):
         self.api_base_url = api_base_url
-        self.llm = LLM(
-            model="gpt-3.5-turbo",  # Using dummy model for demonstration
-            api_key=openai_api_key,
-            base_url="https://api.openai.com/v1"  # Dummy URL / api key
-        )
+        model=LiteLLMModel(model_id="gpt-4o-mini")
+   
         
-        # Initialize the stock advisory API tools
+        # Initialize the stock advisory API tools with the smolagents api
         self.tools = [
-            self._create_init_tool(),
-            self._create_clusters_tool(),
-            self._create_recommend_tool(),
-            self._create_health_check_tool()
-        ]
+            FinalAnswerTool(),
+            self.create_init_tool(),
+            self.create_clusters_tool(),
+            self.create_recommend_tool(),
+            self.create_health_check_tool(),
+            self.create_add_custom_stocks_tool(),
+            self.create_remove_custom_stocks_tool(),
+            self.create_list_custom_stocks_tool(),
+            self.create_clear_custom_stocks_tool()
+        ] 
         
         # Create the agent with tools
-        self.agent = Agent(
+        self.agent = ToolCallingAgent(
             name="StockAdvisor",
             description="An AI agent that provides personalized stock recommendations based on user risk tolerance and investment goals",
             tools=self.tools,
-            llm=self.llm,
-            system_prompt=self._get_system_prompt()
+            llm=self.llm, 
+            system_prompt=self.get_system_prompt() #wrote object oriented so I can organize all code into one spot
         )
         
         # Track if API is initialized
         self.api_initialized = False
     
-    def _get_system_prompt(self) -> str:
+    def get_system_prompt(self) -> str:
         """Get the system prompt for the agent"""
         return """
 You are a professional financial advisor AI agent specializing in stock portfolio recommendations. 
@@ -61,7 +69,11 @@ Your capabilities:
 1. Initialize the stock advisory system with market data
 2. Analyze stock clusters and market conditions
 3. Provide personalized stock recommendations based on user risk tolerance
-4. Explain investment strategies and portfolio allocations
+4. Add custom stocks to the portfolio for analysis
+5. Remove custom stocks from the portfolio
+6. List current custom stocks in the portfolio
+7. Clear all custom stocks from the portfolio
+8. Explain investment strategies and portfolio allocations
 
 Guidelines:
 - Always initialize the API before making recommendations
@@ -70,25 +82,32 @@ Guidelines:
 - Provide risk assessment and expected returns
 - Suggest diversification strategies
 - Be transparent about limitations and risks
+- When users mention specific stocks, use the add_custom_stocks tool
 
 Risk Tolerance Guidelines:
 - Conservative: Low volatility, stable returns, capital preservation
 - Balanced: Moderate risk-return trade-off, steady growth
 - Aggressive: Higher risk for potentially higher returns, growth-focused
 
+Custom Stock Management:
+- Users can add specific stocks like "PLTR, MKL, RBLX" to the portfolio
+- Use add_custom_stocks tool when users mention specific stock symbols
+- Custom stocks are included in portfolio optimization and clustering
+- Always confirm successful addition of custom stocks
+
 Always ask for user's risk tolerance and investment amount before making recommendations.
 """
     
-    def _create_health_check_tool(self) -> Tool:
+    def create_health_check_tool(self) -> Tool:
         """Create tool to check API health"""
         def health_check() -> str:
-            """Check if the stock advisory API is healthy and running"""
+            """Check if api is working"""
             try:
                 response = requests.get(f"{self.api_base_url}/health", timeout=10)
                 if response.status_code == 200:
-                    return "API is healthy and running"
+                    return "API is healthy"
                 else:
-                    return f"API returned status code: {response.status_code}"
+                    return f"API  status code: {response.status_code}"
             except Exception as e:
                 return f"API health check failed: {str(e)}"
         
@@ -98,10 +117,10 @@ Always ask for user's risk tolerance and investment amount before making recomme
             func=health_check
         )
     
-    def _create_init_tool(self) -> Tool:
+    def create_init_tool(self) -> Tool:
         """Create tool to initialize the stock advisory system"""
         def initialize_system() -> str:
-            """Initialize the stock advisory system with market data"""
+            """Initialize the stock advisory system with market data using api init"""
             try:
                 response = requests.post(f"{self.api_base_url}/api/init", timeout=30)
                 if response.status_code == 200:
@@ -141,7 +160,7 @@ The system is now ready to provide personalized recommendations."""
             func=initialize_system
         )
     
-    def _create_clusters_tool(self) -> Tool:
+    def create_clusters_tool(self) -> Tool:
         """Create tool to get stock cluster analysis"""
         def get_clusters() -> str:
             """Get detailed analysis of stock clusters"""
@@ -174,11 +193,11 @@ Cluster {cluster_id} ({cluster_data.get('risk_level', 'Unknown')} Risk):
         
         return Tool(
             name="get_clusters",
-            description="Get detailed analysis of stock clusters and their characteristics",
+            description="Get detailed analysis of stock clusters and their characteristics from api call ",
             func=get_clusters
         )
     
-    def _create_recommend_tool(self) -> Tool:
+    def create_recommend_tool(self) -> Tool:
         """Create tool to get stock recommendations"""
         def get_recommendations(risk_tolerance: str, investment_amount: float, investment_goals: str = "") -> str:
             """Get personalized stock recommendations based on risk tolerance and investment amount
@@ -253,6 +272,164 @@ Note: These are algorithmic recommendations. Please consult with a financial adv
             name="get_recommendations",
             description="Get personalized stock recommendations based on risk tolerance and investment amount",
             func=get_recommendations
+        )
+    
+    def create_add_custom_stocks_tool(self) -> Tool:
+        """Create tool to add custom stocks to the portfolio"""
+        def add_custom_stocks(stock_symbols: str) -> str:
+            """Add custom stocks to the portfolio for analysis
+            
+            Args:
+                stock_symbols: Comma-separated list of stock symbols (e.g., "PLTR,MKL,RBLX")
+            """
+            try:
+                # Parse stock symbols
+                stocks = [s.strip().upper() for s in stock_symbols.split(',')]
+                
+                payload = {"stocks": stocks}
+                response = requests.post(f"{self.api_base_url}/api/stocks/add", 
+                                       json=payload, timeout=15)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('success'):
+                        added = data.get('added', [])
+                        failed = data.get('failed', [])
+                        total = data.get('total_custom_stocks', 0)
+                        
+                        message = f"Successfully added {len(added)} custom stocks to the portfolio."
+                        if added:
+                            message += f" Added: {', '.join(added)}."
+                        if failed:
+                            message += f" Failed: {', '.join(failed)}."
+                        message += f" Total custom stocks: {total}."
+                        
+                        return message
+                    else:
+                        return f"Failed to add stocks: {data.get('message', 'Unknown error')}"
+                else:
+                    return f"API returned status code: {response.status_code}"
+            except Exception as e:
+                return f"Failed to add custom stocks: {str(e)}"
+        
+        return Tool(
+            name="add_custom_stocks",
+            description="Add custom stocks to the portfolio for analysis. Input should be comma-separated stock symbols.",
+            func=add_custom_stocks
+        )
+    
+    def create_remove_custom_stocks_tool(self) -> Tool:
+        """Create tool to remove custom stocks from the portfolio"""
+        def remove_custom_stocks(stock_symbols: str) -> str:
+            """Remove custom stocks from the portfolio
+            
+            Args:
+                stock_symbols: Comma-separated list of stock symbols to remove
+            """
+            try:
+                # Parse stock symbols
+                stocks = [s.strip().upper() for s in stock_symbols.split(',')]
+                
+                payload = {"stocks": stocks}
+                response = requests.post(f"{self.api_base_url}/api/stocks/remove", 
+                                       json=payload, timeout=15)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('success'):
+                        removed = data.get('removed', [])
+                        not_found = data.get('not_found', [])
+                        total = data.get('total_custom_stocks', 0)
+                        
+                        message = f"Successfully removed {len(removed)} custom stocks from the portfolio."
+                        if removed:
+                            message += f" Removed: {', '.join(removed)}."
+                        if not_found:
+                            message += f" Not found: {', '.join(not_found)}."
+                        message += f" Total custom stocks: {total}."
+                        
+                        return message
+                    else:
+                        return f"Failed to remove stocks: {data.get('message', 'Unknown error')}"
+                else:
+                    return f"API returned status code: {response.status_code}"
+            except Exception as e:
+                return f"Failed to remove custom stocks: {str(e)}"
+        
+        return Tool(
+            name="remove_custom_stocks",
+            description="Remove custom stocks from the portfolio. Input should be comma-separated stock symbols.",
+            func=remove_custom_stocks
+        )
+    
+    def create_list_custom_stocks_tool(self) -> Tool:
+        """Create tool to list custom stocks"""
+        def list_custom_stocks() -> str:
+            """Get list of custom stocks in the portfolio"""
+            try:
+                response = requests.get(f"{self.api_base_url}/api/stocks/list", timeout=10)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('success'):
+                        custom_stocks = data.get('custom_stocks', [])
+                        total_custom = data.get('total_custom_stocks', 0)
+                        total_available = data.get('total_available_stocks', 0)
+                        sp500_count = data.get('sp500_stocks_count', 0)
+                        
+                        if custom_stocks:
+                            return f"""Custom Stocks in Portfolio:
+{', '.join(custom_stocks)}
+
+Summary:
+- Custom stocks: {total_custom}
+- S&P 500 stocks: {sp500_count}
+- Total available stocks: {total_available}"""
+                        else:
+                            return f"""No custom stocks added yet.
+
+Summary:
+- Custom stocks: {total_custom}
+- S&P 500 stocks: {sp500_count}
+- Total available stocks: {total_available}
+
+You can add custom stocks using the add_custom_stocks tool."""
+                    else:
+                        return f"Failed to get stock list: {data.get('message', 'Unknown error')}"
+                else:
+                    return f"API returned status code: {response.status_code}"
+            except Exception as e:
+                return f"Failed to get custom stocks: {str(e)}"
+        
+        return Tool(
+            name="list_custom_stocks",
+            description="Get list of custom stocks currently in the portfolio",
+            func=list_custom_stocks
+        )
+    
+    def create_clear_custom_stocks_tool(self) -> Tool:
+        """Create tool to clear all custom stocks"""
+        def clear_custom_stocks() -> str:
+            """Clear all custom stocks from the portfolio"""
+            try:
+                response = requests.post(f"{self.api_base_url}/api/stocks/clear", timeout=10)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('success'):
+                        removed_count = data.get('removed_count', 0)
+                        return f"Successfully cleared {removed_count} custom stocks from the portfolio."
+                    else:
+                        return f"Failed to clear stocks: {data.get('message', 'Unknown error')}"
+                else:
+                    return f"API returned status code: {response.status_code}"
+            except Exception as e:
+                return f"Failed to clear custom stocks: {str(e)}"
+        
+        return Tool(
+            name="clear_custom_stocks",
+            description="Clear all custom stocks from the portfolio",
+            func=clear_custom_stocks
         )
     
     async def chat(self, message: str) -> str:
